@@ -1,0 +1,12 @@
+# Bundled parser metadata for the IntentDiff language-info API.
+
+[plugin]
+author = IntentDiff
+plugin_version = 0.1.0
+last_updated = 2026-07-17
+
+[language.cmake]
+language_name = CMake
+language_short_name = cmake
+monaco_language = cmake
+default_filename = CMakeLists.txt
