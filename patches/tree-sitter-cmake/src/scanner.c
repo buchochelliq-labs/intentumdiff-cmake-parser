@@ -74,6 +74,10 @@ static void parse_bracketed_content(struct TreeSitterCMakeState *state,
       if (level == state->level && lexer->lookahead == ']') {
         break;
       }
+      /* IntentumDiff patch: a candidate whose level did not match (`]=]` inside a level-0
+       * bracket) must not consume the `]` that follows it, which may open the real close:
+       * `#]=]]` closes `#[[`. Re-examine the lookahead instead of advancing past it. */
+      continue;
     }
 
     advance_mark(lexer);
