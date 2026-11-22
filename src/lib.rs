@@ -275,9 +275,67 @@ mod tests {
     }
 
     #[test]
+    fn the_same_source_parses_the_same_way_every_time() {
+        // cmake-parser#4: the vendored scanner's state started uninitialised, so the FIRST
+        // parse in a process dropped `message(${var with space})` (an empty tree) and later
+        // parses did not: a file diffed against itself reported an ADDITION. Every call,
+        // first included, must give the same tree, and the command must be in it.
+        for source in [
+            "message(${var with space})\n",
+            "message(${a ${b}})\nset(x [[bracket]])\n",
+            DEFAULT_OLD,
+        ] {
+            let first = process_impl(source);
+            for _ in 0..3 {
+                assert_eq!(process_impl(source), first, "{source:?}");
+            }
+            let root: SemanticNode = serde_json::from_str(&first).unwrap();
+            let mut commands = Vec::new();
+            labels_by_type(&root, "normal_command", &mut commands);
+            assert!(!commands.is_empty(), "{source:?}: commands dropped: {first}");
+        }
+    }
+
+    /// The vendored scanner's state (`struct TreeSitterCMakeState`): `unsigned level; enum token`.
+    #[repr(C)]
+    struct ScannerState {
+        level: u32,
+        token: u32,
+    }
+
+    extern "C" {
+        fn tree_sitter_cmake_external_scanner_create() -> *mut ScannerState;
+        fn tree_sitter_cmake_external_scanner_destroy(payload: *mut ScannerState);
+        fn tree_sitter_cmake_external_scanner_deserialize(
+            payload: *mut ScannerState,
+            buffer: *const u8,
+            length: u32,
+        );
+    }
+
+    #[test]
+    fn scanner_state_starts_and_restarts_neutral() {
+        // cmake-parser#4, deterministically: `token == 0` is BRACKET_ARGUMENT_OPEN, which made
+        // the first parse swallow ordinary input. A new state and a state reset by a parse
+        // start (deserialize with no saved state) must both hold the neutral LINE_COMMENT (6).
+        const LINE_COMMENT: u32 = 6;
+        unsafe {
+            let state = tree_sitter_cmake_external_scanner_create();
+            assert!(!state.is_null());
+            assert_eq!(((*state).level, (*state).token), (0, LINE_COMMENT), "create");
+            (*state).level = 3;
+            (*state).token = 0;
+            tree_sitter_cmake_external_scanner_deserialize(state, std::ptr::null(), 0);
+            assert_eq!(((*state).level, (*state).token), (0, LINE_COMMENT), "reset");
+            tree_sitter_cmake_external_scanner_destroy(state);
+        }
+    }
+
+    #[test]
     fn source_list_edit_changes_the_root_hash() {
         let old: SemanticNode = serde_json::from_str(&process_impl(DEFAULT_OLD)).unwrap();
         let new: SemanticNode = serde_json::from_str(&process_impl(DEFAULT_NEW)).unwrap();
         assert_ne!(old.structural_hash, new.structural_hash);
     }
 }
+

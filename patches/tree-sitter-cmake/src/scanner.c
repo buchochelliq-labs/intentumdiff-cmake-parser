@@ -103,8 +103,20 @@ static bool is_close_brackets(struct TreeSitterCMakeState *state,
   return true;
 }
 
+/* IntentumDiff patch (cmake-parser#4): the state must start, and restart, neutral.
+ * ts_malloc left `token` uninitialised; fresh memory reads 0 == BRACKET_ARGUMENT_OPEN, so
+ * the first parse in a process took ordinary input such as `message(${var with space})`
+ * for bracket-argument content and dropped the command, while later parses inherited the
+ * previous parse's state. LINE_COMMENT is never compared against `token`, so it is neutral. */
+static void reset_state(struct TreeSitterCMakeState *state) {
+  state->level = 0;
+  state->token = LINE_COMMENT;
+}
+
 void *tree_sitter_cmake_external_scanner_create() {
-  return ts_malloc(sizeof(struct TreeSitterCMakeState));
+  struct TreeSitterCMakeState *state = ts_calloc(1, sizeof(struct TreeSitterCMakeState));
+  reset_state(state);
+  return state;
 }
 
 void tree_sitter_cmake_external_scanner_destroy(void *payload) {
@@ -123,8 +135,7 @@ void tree_sitter_cmake_external_scanner_deserialize(void *payload,
   if (length == STATE_SIZE) {
     memcpy(payload, buffer, length);
   } else {
-    struct TreeSitterCMakeState *state = payload;
-    state->level = 0;
+    reset_state(payload);
   }
 }
 
