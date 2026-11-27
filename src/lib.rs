@@ -154,7 +154,32 @@ fn label_for(node: &CstNode) -> String {
     }
 }
 
-fn parse_source(source: &str) -> Result<CstNode, String> {
+/// A token tree-sitter had to insert to finish the parse (an unterminated `message(` recovers
+/// with a MISSING `)`), as (label, start_line, start_col, end_line, end_col). Only MISSING
+/// tokens count: tree-sitter-cmake also raises ERROR on some valid CMake (bracket comments,
+/// parentheses in `$ENV{}`), so ERROR recovery stays silent as before.
+type SyntaxError = (String, u32, u32, u32, u32);
+
+fn first_syntax_error(node: tree_sitter::Node<'_>) -> Option<SyntaxError> {
+    if node.is_missing() {
+        let (start, end) = (node.start_position(), node.end_position());
+        return Some((
+            format!("missing {}", node.kind()),
+            start.row as u32,
+            start.column as u32,
+            end.row as u32,
+            end.column as u32,
+        ));
+    }
+    if !node.has_error() {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+    children.into_iter().find_map(first_syntax_error)
+}
+
+fn parse_source(source: &str) -> Result<(CstNode, Option<SyntaxError>), String> {
     let mut parser = tree_sitter::Parser::new();
     let lang = tree_sitter_cmake::LANGUAGE.into();
     parser
@@ -163,18 +188,34 @@ fn parse_source(source: &str) -> Result<CstNode, String> {
     let tree = parser
         .parse(source, None)
         .ok_or_else(|| "tree-sitter failed to parse CMake".to_string())?;
-    Ok(node_to_cst(tree.root_node(), source.as_bytes()))
+    Ok((node_to_cst(tree.root_node(), source.as_bytes()), first_syntax_error(tree.root_node())))
+}
+
+fn contains_error(node: &intentumdiff_plugin_sdk::tree::SemanticNode) -> bool {
+    node.node_type == "ERROR" || node.children.iter().any(contains_error)
 }
 
 fn process_impl(source: &str) -> String {
-    let cst = match parse_source(source) {
-        Ok(cst) => cst,
+    let (cst, syntax_error) = match parse_source(source) {
+        Ok(parsed) => parsed,
         Err(err) => return format!(r#"{{"error":"{}"}}"#, err),
     };
     let mut memo = std::collections::HashMap::new();
-    let node = convert_semantic(&cst, "0", &mut memo, &is_semantic, &label_for).unwrap_or_else(|| {
+    let mut node = convert_semantic(&cst, "0", &mut memo, &is_semantic, &label_for).unwrap_or_else(|| {
         SemanticNodeBuilder::new("0", "source_file", LANGUAGE_ID, 0, 0, 0, 0, "0").build()
     });
+    // An input tree-sitter could only finish by inserting a MISSING token (an unterminated
+    // `message(`) must reach the host as a parse error, not as a clean tree: report it as an
+    // ERROR node.
+    if let Some((label, start_line, start_col, end_line, end_col)) = syntax_error {
+        if !contains_error(&node) {
+            let id = format!("{}.{}", node.id, node.children.len());
+            node.children.push(
+                SemanticNodeBuilder::new(id, "ERROR", label, start_line, start_col, end_line, end_col, "")
+                    .build(),
+            );
+        }
+    }
     match serde_json::to_string(&node) {
         Ok(serialized) => serialized,
         Err(err) => format!(r#"{{"error":"Serialisation error: {}"}}"#, err),
@@ -275,9 +316,103 @@ mod tests {
     }
 
     #[test]
+    fn the_same_source_parses_the_same_way_every_time() {
+        // cmake-parser#4: the vendored scanner's state started uninitialised, so the FIRST
+        // parse in a process dropped `message(${var with space})` (an empty tree) and later
+        // parses did not: a file diffed against itself reported an ADDITION. Every call,
+        // first included, must give the same tree, and the command must be in it.
+        for source in [
+            "message(${var with space})\n",
+            "message(${a ${b}})\nset(x [[bracket]])\n",
+            DEFAULT_OLD,
+        ] {
+            let first = process_impl(source);
+            for _ in 0..3 {
+                assert_eq!(process_impl(source), first, "{source:?}");
+            }
+            let root: SemanticNode = serde_json::from_str(&first).unwrap();
+            let mut commands = Vec::new();
+            labels_by_type(&root, "normal_command", &mut commands);
+            assert!(!commands.is_empty(), "{source:?}: commands dropped: {first}");
+        }
+    }
+
+    /// The vendored scanner's state (`struct TreeSitterCMakeState`): `unsigned level; enum token`.
+    #[repr(C)]
+    struct ScannerState {
+        level: u32,
+        token: u32,
+    }
+
+    extern "C" {
+        fn tree_sitter_cmake_external_scanner_create() -> *mut ScannerState;
+        fn tree_sitter_cmake_external_scanner_destroy(payload: *mut ScannerState);
+        fn tree_sitter_cmake_external_scanner_deserialize(
+            payload: *mut ScannerState,
+            buffer: *const u8,
+            length: u32,
+        );
+    }
+
+    #[test]
+    fn scanner_state_starts_and_restarts_neutral() {
+        // cmake-parser#4, deterministically: `token == 0` is BRACKET_ARGUMENT_OPEN, which made
+        // the first parse swallow ordinary input. A new state and a state reset by a parse
+        // start (deserialize with no saved state) must both hold the neutral LINE_COMMENT (6).
+        const LINE_COMMENT: u32 = 6;
+        unsafe {
+            let state = tree_sitter_cmake_external_scanner_create();
+            assert!(!state.is_null());
+            assert_eq!(((*state).level, (*state).token), (0, LINE_COMMENT), "create");
+            (*state).level = 3;
+            (*state).token = 0;
+            tree_sitter_cmake_external_scanner_deserialize(state, std::ptr::null(), 0);
+            assert_eq!(((*state).level, (*state).token), (0, LINE_COMMENT), "reset");
+            tree_sitter_cmake_external_scanner_destroy(state);
+        }
+    }
+
+    #[test]
+    fn invalid_input_reaches_the_host_as_a_parse_error() {
+        // With the scanner fixed, an unterminated call recovers with only a MISSING `)`;
+        // the tree must still carry an ERROR node (RunCMake UnterminatedCall1/2), and valid
+        // input must carry none.
+        for invalid in [
+            "message(\n\n\nmessage(\"Additional message\")\n",
+            "set(var \"\\\n\")\nmessage(\n\n\n",
+        ] {
+            let root: SemanticNode = serde_json::from_str(&process_impl(invalid)).unwrap();
+            let mut errors = Vec::new();
+            labels_by_type(&root, "ERROR", &mut errors);
+            assert!(!errors.is_empty(), "{invalid:?}: no ERROR node: {root:?}");
+        }
+        for valid in [DEFAULT_OLD, DEFAULT_NEW, "message(${var})\n"] {
+            let root: SemanticNode = serde_json::from_str(&process_impl(valid)).unwrap();
+            let mut errors = Vec::new();
+            labels_by_type(&root, "ERROR", &mut errors);
+            assert!(errors.is_empty(), "{valid:?}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn a_mismatched_close_inside_a_bracket_does_not_hide_the_real_close() {
+        // RunCMake BracketComment3: `#]=]]` closes a level-0 `#[[` bracket comment; the
+        // command after it must be parsed, and the file is valid (no ERROR node).
+        let source = "#[[Text on opening line\nmessage(FATAL_ERROR \"x\")\n#]=]]\nmessage(STATUS \"after\")\n";
+        let root: SemanticNode = serde_json::from_str(&process_impl(source)).unwrap();
+        let mut commands = Vec::new();
+        labels_by_type(&root, "normal_command", &mut commands);
+        assert_eq!(commands, vec!["message(STATUS)".to_string()], "{root:?}");
+        let mut errors = Vec::new();
+        labels_by_type(&root, "ERROR", &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
     fn source_list_edit_changes_the_root_hash() {
         let old: SemanticNode = serde_json::from_str(&process_impl(DEFAULT_OLD)).unwrap();
         let new: SemanticNode = serde_json::from_str(&process_impl(DEFAULT_NEW)).unwrap();
         assert_ne!(old.structural_hash, new.structural_hash);
     }
 }
+
